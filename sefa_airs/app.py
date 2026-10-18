@@ -10,6 +10,8 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, DateTime, UniqueConstraint, Text, select
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from sqlalchemy.exc import IntegrityError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 import hmac
 from passlib.context import CryptContext
 
@@ -19,13 +21,62 @@ engine=create_engine(DATABASE_URL,connect_args={'check_same_thread':False} if DA
 SessionLocal=sessionmaker(bind=engine)
 Base=declarative_base()
 crypt=CryptContext(schemes=['bcrypt'],deprecated='auto')
-app=FastAPI(title='SEFA-AIRS Pilot',version='0.19.0')
-secret=os.getenv('SESSION_SECRET')
-if not secret:
-    secret=secrets.token_hex(32)
+app=FastAPI(title='SEFA-AIRS Pilot',version='0.20.0')
+
+def load_session_secret():
+    """Use SESSION_SECRET, else a locally persisted secret so sign-ins survive restarts."""
+    value=os.getenv('SESSION_SECRET')
+    if value:return value
+    path=ROOT/'.session_secret'
+    try:
+        if path.exists() and path.read_text().strip():return path.read_text().strip()
+        value=secrets.token_hex(32);path.write_text(value)
+        try:os.chmod(path,0o600)
+        except OSError:pass
+        return value
+    except OSError:
+        return secrets.token_hex(32)
+secret=load_session_secret()
 app.add_middleware(SessionMiddleware,secret_key=secret,https_only=os.getenv('COOKIE_SECURE','0')=='1',same_site='lax')
 templates=Jinja2Templates(directory=str(ROOT/'templates'))
 app.mount('/static',StaticFiles(directory=str(ROOT/'static')),name='static')
+
+def wants_html(request:Request):
+    """True for normal browser navigation/form posts; False for fetch()/API clients."""
+    return 'text/html' in request.headers.get('accept','')
+
+def error_text(detail):
+    if isinstance(detail,dict):
+        parts=[str(detail.get('message',''))]+[str(e) for e in detail.get('errors',[])]
+        return [x for x in parts if x]
+    if isinstance(detail,list):
+        return [str(e.get('msg',e)) if isinstance(e,dict) else str(e) for e in detail]
+    return [str(detail)]
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error(request:Request,exc:StarletteHTTPException):
+    if wants_html(request):
+        if exc.status_code==401:return RedirectResponse('/',303)
+        titles={403:'Access denied',404:'Not found',409:'Conflict',410:'Expired',413:'File too large',422:'Upload rejected'}
+        return templates.TemplateResponse(request,'error.html',{'status':exc.status_code,'title':titles.get(exc.status_code,'Request could not be completed'),
+            'messages':error_text(exc.detail),'back':request.headers.get('referer') or '/'},status_code=exc.status_code)
+    return JSONResponse({'detail':exc.detail},status_code=exc.status_code,headers=getattr(exc,'headers',None))
+
+from fastapi.exceptions import RequestValidationError
+@app.exception_handler(RequestValidationError)
+async def validation_error(request:Request,exc:RequestValidationError):
+    if wants_html(request):
+        messages=[f"{'.'.join(str(x) for x in e.get('loc',[])[1:])}: {e.get('msg')}" for e in exc.errors()]
+        return templates.TemplateResponse(request,'error.html',{'status':422,'title':'Please check the form','messages':messages,'back':request.headers.get('referer') or '/'},status_code=422)
+    return JSONResponse({'detail':jsonable(exc.errors())},status_code=422)
+
+def jsonable(value):
+    from fastapi.encoders import jsonable_encoder
+    return jsonable_encoder(value)
+
+def blank_none(value):
+    """HTML forms submit empty strings for untouched optional fields."""
+    return value if value not in ('',None) else None
 
 class User(Base):
     __tablename__='users'
@@ -214,8 +265,12 @@ def check_csrf(request:Request,csrf_token:str=Form(...)):
         raise HTTPException(403,'Invalid CSRF token')
 
 @app.post('/login')
-def login(request:Request,username:str=Form(...),password:str=Form(...),s:Session=Depends(db),_csrf:None=Depends(check_csrf)):
-    u=s.query(User).filter(User.username==username).first()
+def login(request:Request,username:str=Form(...),password:str=Form(...),csrf_token:str=Form(''),s:Session=Depends(db)):
+    expected=request.session.get('csrf','')
+    if not expected or not hmac.compare_digest(expected,csrf_token):
+        request.session['csrf']=secrets.token_urlsafe(32)
+        return templates.TemplateResponse(request,'login.html',{'error':'Your sign-in form expired. Please try again.','csrf':request.session['csrf']},status_code=403)
+    u=s.query(User).filter(User.username==username.strip()).first()
     if not u or not crypt.verify(password,u.password_hash):
         return templates.TemplateResponse(request,'login.html',{'error':'Invalid credentials','csrf':request.session.get('csrf','')},status_code=401)
     request.session.clear(); request.session['uid']=u.id; request.session['csrf']=secrets.token_urlsafe(32)
@@ -227,7 +282,11 @@ def logout(request:Request,_csrf:None=Depends(check_csrf)):
 @app.post('/users')
 def add_user(username:str=Form(...),password:str=Form(...),role:str=Form(...),programme:str=Form(''),u:User=Depends(actor),s:Session=Depends(db),_csrf:None=Depends(check_csrf)):
     if u.role!='admin':raise HTTPException(403)
-    if role not in ('admin','dean','hod','lecturer','ta'):raise HTTPException(400)
+    username=username.strip()
+    if not username or len(username)>100:raise HTTPException(400,'Username is required (maximum 100 characters)')
+    if role not in ('admin','dean','hod','lecturer','ta'):raise HTTPException(400,'Invalid role')
+    if programme and programme not in ('Economics','Finance','Accounting'):raise HTTPException(400,'Invalid programme')
+    if role in ('hod','lecturer','ta') and not programme:raise HTTPException(400,'HOD, lecturer and TA accounts must belong to a programme')
     if len(password)<12:raise HTTPException(400,'Password must have at least 12 characters')
     if s.query(User).filter(User.username==username).first():raise HTTPException(409,'Username exists')
     s.add(User(username=username,password_hash=crypt.hash(password),role=role,programme=programme or None));audit(s,u,'create_user',username);s.commit()
@@ -245,8 +304,10 @@ def assign_ta(ta_id:int=Form(...),course_id:int=Form(...),u:User=Depends(actor),
     return RedirectResponse('/',303)
 
 @app.post('/courses')
-def add_course(code:str=Form(...),title:str=Form(...),programme:str=Form(...),academic_year:str=Form(...),session_type:str=Form(...),intake:str=Form(...),module:str=Form(...),start_date:str=Form(...),end_date:str=Form(...),weeks:int=Form(...),lecturer_id:Optional[int]=Form(None),u:User=Depends(actor),s:Session=Depends(db),_csrf:None=Depends(check_csrf)):
+def add_course(code:str=Form(...),title:str=Form(...),programme:str=Form(...),academic_year:str=Form(...),session_type:str=Form(...),intake:str=Form(...),module:str=Form(...),start_date:str=Form(...),end_date:str=Form(...),weeks:int=Form(...),lecturer_id:Optional[str]=Form(None),u:User=Depends(actor),s:Session=Depends(db),_csrf:None=Depends(check_csrf)):
     if u.role not in ('admin','dean','hod'):raise HTTPException(403)
+    try:lecturer_id=int(lecturer_id) if blank_none(lecturer_id) is not None else None
+    except ValueError:raise HTTPException(400,'Invalid lecturer')
     if programme not in ('Economics','Finance','Accounting'):raise HTTPException(400,'Invalid programme')
     if u.role=='hod' and u.programme!=programme:raise HTTPException(403)
     if lecturer_id is not None:
@@ -264,8 +325,14 @@ def add_course(code:str=Form(...),title:str=Form(...),programme:str=Form(...),ac
     if not floated:raise HTTPException(400,'Module is not floated for this academic year, intake, session and module block')
     # A course code can occur in multiple sessions/intakes. Internal offering code is unique per cohort.
     internal_code=f'{code.strip()}-{intake.strip()}-{session_type}-{module.strip()}'
-    c=Course(code=internal_code[:40],title=title,programme=programme,academic_year=academic_year,lecturer_id=lecturer_id)
-    s.add(c);s.flush()
+    if len(internal_code)>40:raise HTTPException(400,'Offering identifier is too long; use shorter intake and module block labels (max 40 characters combined with the module code)')
+    if s.query(Course).filter_by(code=internal_code,academic_year=academic_year).first():
+        raise HTTPException(409,'This course offering already exists for the academic year')
+    c=Course(code=internal_code,title=approved['module_title'],programme=programme,academic_year=academic_year,lecturer_id=lecturer_id)
+    s.add(c)
+    try:s.flush()
+    except IntegrityError:
+        s.rollback();raise HTTPException(409,'This course offering already exists for the academic year')
     s.add(OfferingSchedule(course_id=c.id,session=session_type,intake=intake.strip(),module=module.strip(),start_date=start_date,end_date=end_date,weeks=weeks))
     audit(s,u,'create_course',internal_code);s.commit();return RedirectResponse('/',303)
 
@@ -345,7 +412,7 @@ def course_page(course_id:int,request:Request,u:User=Depends(actor),s:Session=De
     c=require_course(s,u,course_id);people=[{'student':st,'stats':score(s,c.id,st.id)} for st in roster(s,c.id)]
     topics=s.query(Topic).filter_by(course_id=c.id).all()
     planned=sum(t.planned_hours for t in topics);completed=sum(min(t.completed_hours,t.planned_hours) for t in topics)
-    return templates.TemplateResponse(request,'course.html',{'user':u,'course':c,'people':people,'topics':topics,'coverage':round(completed/planned*100,1) if planned else None,'weekly':week_report(s,c.id),'schedule':s.query(OfferingSchedule).filter_by(course_id=c.id).first(),'csrf':request.session.get('csrf','')})
+    return templates.TemplateResponse(request,'course.html',{'user':u,'course':c,'people':people,'topics':topics,'coverage':round(completed/planned*100,1) if planned else None,'weekly':week_report(s,c.id),'schedule':s.query(OfferingSchedule).filter_by(course_id=c.id).first(),'credit_config':s.get(OfferingCreditConfig,c.id),'csrf':request.session.get('csrf','')})
 
 @app.post('/courses/{course_id}/attendance')
 def record_attendance(course_id:int,student_id:int=Form(...),session_date:str=Form(...),status:str=Form(...),u:User=Depends(actor),s:Session=Depends(db),_csrf:None=Depends(check_csrf)):
@@ -429,12 +496,14 @@ def parse_tabular_upload(filename,raw):
     if len(raw)>5_000_000:raise HTTPException(413,'File exceeds 5MB')
     try:
         if filename.lower().endswith('.csv'):
-            return list(csv.DictReader(io.StringIO(raw.decode('utf-8-sig'))))
+            reader=csv.DictReader(io.StringIO(raw.decode('utf-8-sig')))
+            if reader.fieldnames:reader.fieldnames=[(h or '').strip().lower() for h in reader.fieldnames]
+            return [r for r in reader if any(str(v or '').strip() for v in r.values())]
         if filename.lower().endswith('.xlsx'):
             from openpyxl import load_workbook
             wb=load_workbook(io.BytesIO(raw),read_only=True,data_only=True)
             vals=wb.active.values
-            headers=[str(v).strip() if v is not None else '' for v in next(vals)]
+            headers=[str(v).strip().lower() if v is not None else '' for v in next(vals)]
             return [dict(zip(headers,r)) for r in vals if any(v is not None for v in r)]
     except Exception as exc:raise HTTPException(400,f'Invalid spreadsheet: {exc}')
     raise HTTPException(400,'Only CSV or XLSX supported')
@@ -485,7 +554,8 @@ async def preview_import(course_id:int,request:Request,kind:str=Form(...),file:U
     rows=parse_tabular_upload(file.filename or '',await file.read())
     if kind=='attendance':
         enrolled={st.student_no:st.id for st in roster(s,course_id)}
-        cleaned,errors=attendance_rows(rows,enrolled)
+        try:cleaned,errors=attendance_rows(rows,enrolled)
+        except ValueError as exc:cleaned,errors=[],[str(exc)]
     else:
         existing={}
         for st in s.query(Student).filter_by(programme=course.programme).all():
@@ -515,7 +585,8 @@ def confirm_import(course_id:int,token:str,u:User=Depends(actor),s:Session=Depen
     try:
         if staged.import_type=='attendance':
             enrolled={st.student_no:st.id for st in roster(s,course_id)}
-            records,errors=attendance_rows(records,enrolled)
+            try:records,errors=attendance_rows(records,enrolled)
+            except ValueError as exc:records,errors=[],[str(exc)]
             if errors:raise HTTPException(422,{'errors':errors})
             for record in records:
                 sid=enrolled[record['student_no']]
@@ -601,6 +672,9 @@ def school_weekly_coverage(session_type:Optional[str]=None,intake:Optional[str]=
 
 @app.get('/health')
 def health():return {'status':'ok'}
+
+@app.get('/favicon.ico',include_in_schema=False)
+def favicon():return Response(status_code=204)
 
 @app.get('/api/courses/{course_id}/coverage')
 def coverage_api(course_id:int,u:User=Depends(actor),s:Session=Depends(db)):
@@ -732,6 +806,7 @@ def course_academic_monitor(course_id:int, credits:Optional[int]=None, as_of:Opt
                             excluded_dates:Optional[str]=None,
                             u:User=Depends(actor), s:Session=Depends(db)):
     require_course(s,u,course_id)
+    as_of=blank_none(as_of);weekdays=blank_none(weekdays);excluded_dates=blank_none(excluded_dates)
     offering=s.query(OfferingSchedule).filter_by(course_id=course_id).first()
     if not offering: raise HTTPException(422,'Course has no configured modular schedule')
     configured=s.get(OfferingCreditConfig,course_id)
@@ -761,6 +836,8 @@ def course_academic_monitor(course_id:int, credits:Optional[int]=None, as_of:Opt
 def school_academic_monitor(credits:Optional[int]=None,session_type:Optional[str]=None,
                             intake:Optional[str]=None,module:Optional[str]=None,
                             as_of:Optional[str]=None,u:User=Depends(actor),s:Session=Depends(db)):
+    as_of=blank_none(as_of)
+    if credits is not None and credits not in (10,15):raise HTTPException(422,'Credits must be 10 or 15')
     # Credit hours must be explicitly supplied until credits are verified and
     # persisted per floated offering. Do not silently assume 10 or 15 credits.
     result=[]
@@ -772,7 +849,7 @@ def school_academic_monitor(credits:Optional[int]=None,session_type:Optional[str
         if intake and schedule.intake!=intake:continue
         if module and schedule.module!=module:continue
         if not s.get(OfferingCreditConfig,c.id): continue
-        result.append(course_academic_monitor(c.id,None,as_of,u=u,s=s))
+        result.append(course_academic_monitor(c.id,None,as_of,0,10,5,1,None,None,u=u,s=s))
     return {'courses':result,'warning':'Unconfigured offerings are excluded; verify their credit values before monitoring.'}
 
 
@@ -841,7 +918,7 @@ def monitoring_export(programme:str='',session_type:str='',intake:str='',module:
 
 # Version 0.14: credit verification and weekly trends for each floated offering.
 @app.post('/api/courses/{course_id}/credits')
-def verify_offering_credits(course_id:int, credits:int=Form(...), u:User=Depends(actor),
+def verify_offering_credits(request:Request, course_id:int, credits:int=Form(...), u:User=Depends(actor),
                             s:Session=Depends(db), _csrf:None=Depends(check_csrf)):
     course=require_course(s,u,course_id)
     if u.role not in ('dean','admin','hod') or (u.role=='hod' and u.programme!=course.programme):
@@ -855,11 +932,13 @@ def verify_offering_credits(course_id:int, credits:int=Form(...), u:User=Depends
         config.credits=credits;config.verified_by=u.id;config.verified_at=datetime.utcnow()
     audit(s,u,'verify_offering_credits',f'{course_id}: {credits}')
     s.commit()
+    if wants_html(request):return RedirectResponse(f'/courses/{course_id}',303)
     return {'course_id':course_id,'credits':credits,'verified':True}
 
 @app.get('/api/courses/{course_id}/weekly-trends')
 def course_weekly_trends(course_id:int, as_of:Optional[str]=None, u:User=Depends(actor),s:Session=Depends(db)):
     require_course(s,u,course_id)
+    as_of=blank_none(as_of)
     schedule=s.query(OfferingSchedule).filter_by(course_id=course_id).first()
     config=s.get(OfferingCreditConfig,course_id)
     if not schedule or not config: raise HTTPException(422,'Schedule and verified credits required')
@@ -880,7 +959,7 @@ def course_weekly_trends(course_id:int, as_of:Optional[str]=None, u:User=Depends
 
 # Version 0.15: verified weekly teaching plans, TA evidence, HOD approval.
 @app.post('/courses/{course_id}/teaching-plan/import')
-async def teaching_plan_import(course_id:int,file:UploadFile=File(...),u:User=Depends(actor),s:Session=Depends(db),_csrf:None=Depends(check_csrf)):
+async def teaching_plan_import(request:Request,course_id:int,file:UploadFile=File(...),u:User=Depends(actor),s:Session=Depends(db),_csrf:None=Depends(check_csrf)):
     c=require_course(s,u,course_id)
     if u.role not in ('lecturer','hod','dean'):raise HTTPException(403,'Academic staff only')
     from teaching_workflow import validate_plan_rows
@@ -897,6 +976,7 @@ async def teaching_plan_import(course_id:int,file:UploadFile=File(...),u:User=De
         s.add(TeachingPlanItem(course_id=course_id,week_no=week,planned_topic=topic,planned_hours=hours,updated_by=u.id))
     audit(s,u,'teaching_plan_import',f'course={course_id} topics={len(clean)}')
     s.commit()
+    if wants_html(request):return RedirectResponse(f'/courses/{course_id}',303)
     return {'course_id':course_id,'topics_imported':len(clean),'status':'planned'}
 
 @app.post('/api/teaching-plan/{item_id}/report')

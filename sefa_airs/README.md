@@ -210,3 +210,20 @@ This remains a development pilot, not a production-certified system.
 - The course-code uniqueness constraint and course-code truncation still need a versioned, tested database migration. Do not alter the existing database schema by editing the ORM constraint alone.
 - Authentication rate limiting, secure password recovery, migration tooling, integration tests, security review, and fairness evaluation remain required for production.
 - Run `pip install -r requirements.txt`, then `PYTHONPATH=. pytest -q` from this folder. Production student records must not be imported before institutional security and data protection approvals.
+
+## Version 0.20: end-to-end runtime fixes
+
+Verified by driving the full workflow over HTTP and in a real browser (float module → create offering → assign TA → roster/attendance preview and confirm → teaching plan report/verify/approve → risk and monitoring pages).
+
+- Fixed server crashes (HTTP 500): duplicate course offering (now 409), attendance preview with missing columns or an empty file (now shown as "Import blocked"), and the academic monitoring report form when "Report through" is left blank.
+- Offering identifiers longer than 40 characters are rejected with a clear message instead of being silently truncated.
+- Browser users get a readable error page instead of raw JSON; an expired session redirects to sign-in; a stale login form asks you to retry instead of failing with "Invalid CSRF token". API/fetch clients still receive JSON.
+- Without `SESSION_SECRET`, a secret is generated once and kept in `.session_secret` so restarting the server no longer signs everyone out. Set `SESSION_SECRET` explicitly in production.
+- "Verify credits" and "Upload teaching plan" forms return to the course page instead of showing JSON.
+- The "Create course offering" form no longer loses the selected module when fields change, and ignores out-of-order responses.
+- User creation validates programme; HOD, lecturer and TA accounts must belong to a programme.
+- CSV/XLSX headers are trimmed and case-insensitive; blank CSV rows are ignored.
+- Grade, topic and intervention forms are hidden from technical administrators (the server already rejected them).
+- Added `tests/test_end_to_end.py`; tests run on a temporary database (`tests/conftest.py`), never on `sefa.db`.
+
+Run tests: `pip install -r requirements.txt` then `python -m pytest -q` from this folder.
