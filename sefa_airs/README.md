@@ -2,7 +2,18 @@
 
 A standalone FastAPI web app for user accounts, course offerings, student CSV/XLSX imports, attendance, assessment scores, course-topic coverage, rule-based risk analytics, interventions, and CSV reports. It is **not** a complete or production-certified system.
 
-## Windows setup
+## Quick start on Windows (recommended)
+
+1. Install Python 3.11+ from https://www.python.org/downloads/ and tick **"Add python.exe to PATH"**.
+2. Double-click `start_windows.bat` in this folder.
+3. On first run choose **D** for demo data (made-up students) or **A** to create your own admin account.
+4. Your browser opens http://127.0.0.1:8000. Keep the black window open while using the app; close it to stop.
+
+The app only runs while that window is open, on the same computer. "127.0.0.1 refused to connect" means the server is not running.
+
+Demo accounts (only with demo data): `admin` / `DemoAdmin2026!`; `dean`, `hod.finance`, `lecturer.finance`, `ta.finance` / `DemoPass2026!`. To start over, close the app and delete `sefa.db`.
+
+## Windows setup (manual)
 
 1. Install Python 3.11+.
 2. In PowerShell, from this folder:
