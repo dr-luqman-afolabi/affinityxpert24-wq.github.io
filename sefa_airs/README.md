@@ -13,6 +13,10 @@ The app only runs while that window is open, on the same computer. "127.0.0.1 re
 
 Demo accounts (only with demo data): `admin` / `DemoAdmin2026!`; `dean`, `hod.finance`, `lecturer.finance`, `ta.finance` / `DemoPass2026!`. To start over, close the app and delete `sefa.db`.
 
+### Use it from other computers on the same network
+
+Double-click `start_network.bat` instead (macOS/Linux: `sh start_mac_linux.sh network`). The window prints an address such as `http://192.168.1.25:8000`; colleagues on the same Wi-Fi/LAN open that address in any browser, with no installation. Allow the Windows firewall prompt for **Private networks**. The host PC must stay on with the window open. Use only synthetic data: traffic is plain HTTP and the pilot has no login rate limiting.
+
 ## Windows setup (manual)
 
 1. Install Python 3.11+.

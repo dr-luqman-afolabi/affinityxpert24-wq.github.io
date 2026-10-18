@@ -1,6 +1,8 @@
 @echo off
 REM SEFA-AIRS one-click start for Windows. Double-click this file.
 cd /d "%~dp0"
+set HOST=127.0.0.1
+if /i "%~1"=="network" set HOST=0.0.0.0
 title SEFA-AIRS
 echo Step 1 of 4: looking for Python 3.10 or newer...
 set PY=
@@ -32,7 +34,16 @@ if not errorlevel 1 (
   if errorlevel 1 (pause & exit /b 1)
 )
 echo.
-echo Step 4 of 4: SEFA-AIRS is starting at http://127.0.0.1:8000  -  keep this window open; close it to stop the app.
+echo Step 4 of 4: SEFA-AIRS is starting  -  keep this window open; close it to stop the app.
+echo   On this PC open:  http://127.0.0.1:8000
+if not "%HOST%"=="0.0.0.0" goto skipnetwork
+for /f %%i in ('python -c "import socket;s=socket.socket(2,2);s.connect(('10.255.255.255',1));print(s.getsockname()[0])" 2^>nul') do set LANIP=%%i
+echo.
+echo   NETWORK MODE: other computers on the same network can open
+echo     http://%LANIP%:8000
+echo   If Windows asks about the firewall, tick "Private networks" and click Allow.
+:skipnetwork
+echo.
 start "" cmd /c "timeout /t 4 >nul & start http://127.0.0.1:8000"
-python -m uvicorn app:app --host 127.0.0.1 --port 8000
+python -m uvicorn app:app --host %HOST% --port 8000
 pause
