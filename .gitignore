@@ -4,3 +4,4 @@ __pycache__/
 .pytest_cache/
 sefa_airs/sefa.db
 sefa_airs/.session_secret
+sefa_airs/settings.env

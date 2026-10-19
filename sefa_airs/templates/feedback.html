@@ -1,0 +1,14 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Give feedback · SEFA-AIRS</title><link rel="stylesheet" href="/static/style.css"><link rel="stylesheet" href="/static/interface.css"><link rel="stylesheet" href="/static/pilot.css"></head><body data-role="{{user.role}}">
+<header><div><strong>SEFA<span class="accent">·</span>AIRS</strong><small>Pilot feedback · University of Kigali</small></div><div class="account">{{user.username}} · {{user.role|upper}}</div></header>
+<main><div class="eyebrow">SEFA / PILOT PHASE</div><h1>Give feedback</h1>
+<p class="lead">Your feedback decides what is improved before full rollout. It takes about a minute. Please don't include student names or numbers.</p>
+{% if sent %}<div class="notice" role="status">Thank you. Your feedback was saved.</div>{% endif %}
+<section class="panel"><form method="post" action="/feedback" class="stack"><input type="hidden" name="csrf_token" value="{{csrf}}">
+<label>Which part of the system?<select name="feature" required>{% for f in features %}<option {% if f=='Overall system' %}selected{% endif %}>{{f}}</option>{% endfor %}</select></label>
+<label>Type<select name="kind"><option value="feedback">General feedback</option><option value="bug">Something is not working</option><option value="feature_request">Something is missing (feature request)</option></select></label>
+<fieldset class="stack" style="border:0;padding:0;margin:0"><legend class="muted">How useful is it for your work? (1 = not useful, 5 = very useful)</legend><div class="rating">{% for n in range(1,6) %}<label><input type="radio" name="usefulness" value="{{n}}"> {{n}}</label>{% endfor %}</div></fieldset>
+<fieldset class="stack" style="border:0;padding:0;margin:0"><legend class="muted">How easy is it to use? (1 = very hard, 5 = very easy)</legend><div class="rating">{% for n in range(1,6) %}<label><input type="radio" name="ease" value="{{n}}"> {{n}}</label>{% endfor %}</div></fieldset>
+<label>Comments (required for problems and requests)<textarea name="comment" rows="4" maxlength="2000" placeholder="What worked, what didn't, what you need..."></textarea></label>
+<button type="submit">Send feedback</button></form></section>
+{% if mine %}<section class="panel"><h2>Your recent feedback</h2><ul class="feed">{% for f in mine %}<li><b>{{f.feature}}</b> · {{f.kind|replace('_',' ')}} · {{f.created_at.date()}}{% if f.comment %}<p>{{f.comment}}</p>{% endif %}</li>{% endfor %}</ul></section>{% endif %}
+</main><script src="/static/interface.js" defer></script></body></html>

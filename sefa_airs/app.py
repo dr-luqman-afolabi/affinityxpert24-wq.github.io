@@ -16,12 +16,23 @@ import hmac
 from passlib.context import CryptContext
 
 ROOT=Path(__file__).resolve().parent
+
+def load_settings_file(path):
+    """Read KEY=VALUE lines from settings.env (e.g. MOODLE_URL); real environment variables win."""
+    try:lines=path.read_text(encoding='utf-8-sig').splitlines()
+    except OSError:return
+    for line in lines:
+        line=line.strip()
+        if line and not line.startswith('#') and '=' in line:
+            key,value=line.split('=',1)
+            os.environ.setdefault(key.strip(),value.strip().strip('"').strip("'"))
+load_settings_file(ROOT/'settings.env')
 DATABASE_URL=os.getenv('DATABASE_URL',f'sqlite:///{ROOT / "sefa.db"}')
 engine=create_engine(DATABASE_URL,connect_args={'check_same_thread':False} if DATABASE_URL.startswith('sqlite') else {})
 SessionLocal=sessionmaker(bind=engine)
 Base=declarative_base()
 crypt=CryptContext(schemes=['bcrypt'],deprecated='auto')
-app=FastAPI(title='SEFA-AIRS Pilot',version='0.20.0')
+app=FastAPI(title='SEFA-AIRS Pilot',version='0.21.0')
 
 def load_session_secret():
     """Use SESSION_SECRET, else a locally persisted secret so sign-ins survive restarts."""
@@ -201,6 +212,47 @@ class PendingImport(Base):
     filename=Column(String(200),nullable=False)
     created_at=Column(DateTime,default=datetime.utcnow,nullable=False)
 
+class UsageEvent(Base):
+    """Pilot usage analytics: which feature a staff role used. No student identifiers."""
+    __tablename__='usage_events'
+    id=Column(Integer,primary_key=True)
+    user_id=Column(Integer,ForeignKey('users.id'),nullable=False)
+    role=Column(String(20),nullable=False)
+    feature=Column(String(100),nullable=False)
+    method=Column(String(8),nullable=False)
+    created_at=Column(DateTime,default=datetime.utcnow,nullable=False)
+class PilotFeedback(Base):
+    __tablename__='pilot_feedback'
+    id=Column(Integer,primary_key=True)
+    user_id=Column(Integer,ForeignKey('users.id'),nullable=False)
+    role=Column(String(20),nullable=False)
+    feature=Column(String(100),nullable=False)
+    kind=Column(String(20),nullable=False)  # feedback, bug, feature_request
+    usefulness=Column(Integer,nullable=True)  # 1-5
+    ease=Column(Integer,nullable=True)  # 1-5
+    comment=Column(Text,default='')
+    created_at=Column(DateTime,default=datetime.utcnow,nullable=False)
+class LmsActivity(Base):
+    """Latest LMS engagement snapshot per enrolment. Context for staff; not scored in the risk index."""
+    __tablename__='lms_activity'
+    id=Column(Integer,primary_key=True)
+    course_id=Column(Integer,ForeignKey('courses.id'),nullable=False)
+    student_id=Column(Integer,ForeignKey('students.id'),nullable=False)
+    last_access=Column(String(10),nullable=True)
+    activities_completed=Column(Integer,nullable=True)
+    activities_total=Column(Integer,nullable=True)
+    minutes_active=Column(Float,nullable=True)
+    source=Column(String(20),nullable=False)
+    imported_by=Column(Integer,ForeignKey('users.id'))
+    imported_at=Column(DateTime,default=datetime.utcnow,onupdate=datetime.utcnow)
+    __table_args__=(UniqueConstraint('course_id','student_id',name='unique_lms_activity'),)
+class LmsCourseLink(Base):
+    __tablename__='lms_course_links'
+    course_id=Column(Integer,ForeignKey('courses.id'),primary_key=True)
+    lms_course_id=Column(Integer,nullable=False)
+    linked_by=Column(Integer,ForeignKey('users.id'))
+    last_sync_at=Column(DateTime,nullable=True)
+
 class Audit(Base):
     __tablename__='audit'
     id=Column(Integer,primary_key=True); user_id=Column(Integer); action=Column(String(100)); detail=Column(Text); created_at=Column(DateTime,default=datetime.utcnow)
@@ -215,7 +267,20 @@ def actor(request:Request,s:Session=Depends(db)):
     uid=request.session.get('uid')
     u=s.get(User,uid) if uid else None
     if not u: raise HTTPException(401,'Please sign in')
+    log_usage(request,u)
     return u
+
+def log_usage(request,u,feature=None):
+    """Record page views and actions (not background data calls) for pilot evaluation."""
+    if feature is None:
+        if request.method=='GET' and not wants_html(request) and not request.url.path.endswith('.csv'):return
+        from pilot import feature_name
+        feature=feature_name(getattr(request.scope.get('route'),'path',request.url.path))
+    try:
+        with SessionLocal() as session:
+            session.add(UsageEvent(user_id=u.id,role=u.role,feature=feature,method=request.method[:8]));session.commit()
+    except Exception:
+        pass  # analytics must never block academic work
 
 def allowed(u,course):
     if u.role in ('admin','dean'): return True
@@ -274,6 +339,7 @@ def login(request:Request,username:str=Form(...),password:str=Form(...),csrf_tok
     if not u or not crypt.verify(password,u.password_hash):
         return templates.TemplateResponse(request,'login.html',{'error':'Invalid credentials','csrf':request.session.get('csrf','')},status_code=401)
     request.session.clear(); request.session['uid']=u.id; request.session['csrf']=secrets.token_urlsafe(32)
+    log_usage(request,u,'Sign-in')
     return RedirectResponse('/',303)
 @app.post('/logout')
 def logout(request:Request,_csrf:None=Depends(check_csrf)):
@@ -408,11 +474,11 @@ def score(s,course_id,student_id):
             'risk':result['risk_index'],'label':result['risk_band']}
 
 @app.get('/courses/{course_id}',response_class=HTMLResponse)
-def course_page(course_id:int,request:Request,u:User=Depends(actor),s:Session=Depends(db)):
+def course_page(course_id:int,request:Request,msg:str='',u:User=Depends(actor),s:Session=Depends(db)):
     c=require_course(s,u,course_id);people=[{'student':st,'stats':score(s,c.id,st.id)} for st in roster(s,c.id)]
     topics=s.query(Topic).filter_by(course_id=c.id).all()
     planned=sum(t.planned_hours for t in topics);completed=sum(min(t.completed_hours,t.planned_hours) for t in topics)
-    return templates.TemplateResponse(request,'course.html',{'user':u,'course':c,'people':people,'topics':topics,'coverage':round(completed/planned*100,1) if planned else None,'weekly':week_report(s,c.id),'schedule':s.query(OfferingSchedule).filter_by(course_id=c.id).first(),'credit_config':s.get(OfferingCreditConfig,c.id),'csrf':request.session.get('csrf','')})
+    return templates.TemplateResponse(request,'course.html',{'user':u,'course':c,'people':people,'topics':topics,'coverage':round(completed/planned*100,1) if planned else None,'weekly':week_report(s,c.id),'schedule':s.query(OfferingSchedule).filter_by(course_id=c.id).first(),'credit_config':s.get(OfferingCreditConfig,c.id),'lms':lms_summary(s,c.id,len(people)),'message':msg[:300],'csrf':request.session.get('csrf','')})
 
 @app.post('/courses/{course_id}/attendance')
 def record_attendance(course_id:int,student_id:int=Form(...),session_date:str=Form(...),status:str=Form(...),u:User=Depends(actor),s:Session=Depends(db),_csrf:None=Depends(check_csrf)):
@@ -492,18 +558,19 @@ def intervention(course_id:int,student_id:int=Form(...),note:str=Form(...),u:Use
     s.add(Intervention(student_id=student_id,course_id=course_id,note=note[:2000],created_by=u.id));audit(s,u,'intervention',str(student_id));s.commit()
     return RedirectResponse(f'/courses/{course_id}',303)
 
-def parse_tabular_upload(filename,raw):
+def parse_tabular_upload(filename,raw,lower_headers=True):
+    norm=(lambda h:h.strip().lower()) if lower_headers else (lambda h:h.strip())
     if len(raw)>5_000_000:raise HTTPException(413,'File exceeds 5MB')
     try:
         if filename.lower().endswith('.csv'):
             reader=csv.DictReader(io.StringIO(raw.decode('utf-8-sig')))
-            if reader.fieldnames:reader.fieldnames=[(h or '').strip().lower() for h in reader.fieldnames]
+            if reader.fieldnames:reader.fieldnames=[norm(h or '') for h in reader.fieldnames]
             return [r for r in reader if any(str(v or '').strip() for v in r.values())]
         if filename.lower().endswith('.xlsx'):
             from openpyxl import load_workbook
             wb=load_workbook(io.BytesIO(raw),read_only=True,data_only=True)
             vals=wb.active.values
-            headers=[str(v).strip().lower() if v is not None else '' for v in next(vals)]
+            headers=[norm(str(v)) if v is not None else '' for v in next(vals)]
             return [dict(zip(headers,r)) for r in vals if any(v is not None for v in r)]
     except Exception as exc:raise HTTPException(400,f'Invalid spreadsheet: {exc}')
     raise HTTPException(400,'Only CSV or XLSX supported')
@@ -1071,7 +1138,24 @@ def student_intelligence(s, course_id, student_id):
             scheduled_dates=[x['date'] for x in calendar['days'] if x['activity']=='teaching']
         except ValueError:
             pass  # Unverified timetable: do not silently treat unscheduled days as absent.
-    return analyze_student(attendance,assessments,interventions,scheduled_dates=scheduled_dates)
+    result=analyze_student(attendance,assessments,interventions,scheduled_dates=scheduled_dates)
+    add_lms_context(result,s.query(LmsActivity).filter_by(course_id=course_id,student_id=student_id).first())
+    return result
+
+def add_lms_context(result,lms):
+    """LMS engagement is shown to staff as context; it does not change the risk index or band."""
+    from lms import days_since
+    days=days_since(lms.last_access) if lms else None
+    completion=round(100*lms.activities_completed/lms.activities_total,1) if lms and lms.activities_total and lms.activities_completed is not None else None
+    result.update({'lms_last_access':lms.last_access if lms else None,'lms_days_since_access':days,'lms_completion_percent':completion})
+    flagged=False
+    if lms and lms.last_access is None:
+        result['reasons'].append('No recorded LMS course access (context only; not scored)');flagged=True
+    elif days is not None and days>14:
+        result['reasons'].append(f'No LMS course access for {days} days (context only; not scored)');flagged=True
+    if completion is not None and completion<50:
+        result['reasons'].append(f'LMS activity completion {completion}% (context only; not scored)');flagged=True
+    if flagged:result['suggested_support'].append('Check LMS access and online engagement with the student')
 
 @app.get('/api/courses/{course_id}/ai-risk')
 def ai_risk_course(course_id:int,u:User=Depends(actor),s:Session=Depends(db)):
@@ -1132,3 +1216,207 @@ def ai_risk_validation(payload:ValidationBatch,request:Request,u:User=Depends(ac
         raise HTTPException(403,'CSRF token required')
     if u.role not in ('dean','hod'):raise HTTPException(403)
     raise HTTPException(409,'Historical validation disabled until timestamped pre-outcome feature snapshots and outcome dates are available. Current data may leak future information.')
+
+
+# v0.21: LMS (Moodle) evidence, pilot evaluation analytics, feedback and capability benchmark.
+from urllib.parse import quote
+from lms import parse_engagement_rows, parse_grade_rows, MoodleClient, MoodleError
+import pilot as pilot_mod
+
+def lms_summary(s,course_id,enrolled):
+    rows=s.query(LmsActivity).filter_by(course_id=course_id).all()
+    link=s.get(LmsCourseLink,course_id)
+    return {'students_with_data':len(rows),'enrolled':enrolled,'last_import':max((r.imported_at for r in rows),default=None),
+            'link':link,'configured':pilot_mod.moodle_configured()}
+
+def save_lms_evidence(s,u,course_id,engagement,grades,source):
+    """Match LMS rows to this offering's roster by student number (Moodle ID number or username)."""
+    students={st.student_no.strip().lower():st for st in roster(s,course_id)}
+    unmatched=set()
+    def find(item):
+        keys=[item['student_no']] if 'student_no' in item else item['keys']
+        for key in keys:
+            if key.strip().lower() in students:return students[key.strip().lower()]
+        unmatched.add(keys[0] if keys else '(blank)')
+    engaged=set();graded=set();grade_rows=0
+    for item in engagement:
+        st=find(item)
+        if not st:continue
+        row=s.query(LmsActivity).filter_by(course_id=course_id,student_id=st.id).first()
+        if row is None:row=LmsActivity(course_id=course_id,student_id=st.id,source=source);s.add(row)
+        row.last_access=item['last_access'];row.activities_completed=item['activities_completed'];row.activities_total=item['activities_total']
+        row.minutes_active=item['minutes_active'];row.source=source;row.imported_by=u.id;row.imported_at=datetime.utcnow()
+        engaged.add(st.id)
+    for item in grades:
+        st=find(item)
+        if not st:continue
+        title=('LMS: '+item['item'])[:100]
+        row=s.query(Assessment).filter_by(course_id=course_id,student_id=st.id,kind=item['kind'],title=title).first()
+        if row is None:row=Assessment(course_id=course_id,student_id=st.id,kind=item['kind'],title=title);s.add(row)
+        row.score=item['score'];row.max_score=item['max_score'];graded.add(st.id);grade_rows+=1
+    audit(s,u,'lms_import',f'course={course_id} source={source} engagement={len(engaged)} grades={grade_rows} unmatched={len(unmatched)}')
+    return len(engaged),len(graded),grade_rows,len(unmatched)
+
+def lms_message(engaged,graded,grade_rows,unmatched):
+    parts=[]
+    if engaged:parts.append(f'LMS engagement saved for {engaged} students')
+    if grade_rows:parts.append(f'{grade_rows} LMS grades saved for {graded} students')
+    if not parts:parts.append('No matching students found')
+    if unmatched:parts.append(f'{unmatched} LMS accounts are not on this roster and were skipped (e.g. teachers or other cohorts)')
+    return '; '.join(parts)+'.'
+
+def require_lms_staff(s,u,course_id,roles):
+    c=require_course(s,u,course_id)
+    if u.role not in roles:raise HTTPException(403,'Your role cannot change LMS data for this course')
+    if u.role=='lecturer' and c.lecturer_id!=u.id:raise HTTPException(403,'Assigned lecturer only')
+    return c
+
+@app.post('/courses/{course_id}/lms/engagement')
+async def lms_engagement_import(course_id:int,file:UploadFile=File(...),u:User=Depends(actor),s:Session=Depends(db),_csrf:None=Depends(check_csrf)):
+    require_lms_staff(s,u,course_id,('ta','lecturer','hod','dean'))
+    rows=parse_tabular_upload(file.filename or '',await file.read())
+    try:records,errors=parse_engagement_rows(rows)
+    except ValueError as exc:records,errors=[],[str(exc)]
+    if errors:raise HTTPException(422,{'message':'Nothing imported; correct the LMS engagement file','errors':errors[:30]})
+    result=save_lms_evidence(s,u,course_id,records,[],'spreadsheet');s.commit()
+    return RedirectResponse(f'/courses/{course_id}?msg='+quote(lms_message(*result)),303)
+
+@app.post('/courses/{course_id}/lms/grades')
+async def lms_grades_import(course_id:int,file:UploadFile=File(...),u:User=Depends(actor),s:Session=Depends(db),_csrf:None=Depends(check_csrf)):
+    require_lms_staff(s,u,course_id,('lecturer','hod','dean'))
+    rows=parse_tabular_upload(file.filename or '',await file.read(),lower_headers=False)
+    try:records,errors=parse_grade_rows(rows)
+    except ValueError as exc:records,errors=[],[str(exc)]
+    if errors:raise HTTPException(422,{'message':'Nothing imported; correct the LMS grade file','errors':errors[:30]})
+    result=save_lms_evidence(s,u,course_id,[],records,'spreadsheet');s.commit()
+    return RedirectResponse(f'/courses/{course_id}?msg='+quote(lms_message(*result)),303)
+
+@app.post('/courses/{course_id}/lms/link')
+def lms_link(course_id:int,lms_course_id:int=Form(...),u:User=Depends(actor),s:Session=Depends(db),_csrf:None=Depends(check_csrf)):
+    require_lms_staff(s,u,course_id,('lecturer','hod','dean','admin'))
+    if lms_course_id<=0:raise HTTPException(400,'Moodle course ID must be a positive number (see id= in the Moodle course URL)')
+    link=s.get(LmsCourseLink,course_id)
+    if link is None:link=LmsCourseLink(course_id=course_id,lms_course_id=lms_course_id);s.add(link)
+    link.lms_course_id=lms_course_id;link.linked_by=u.id
+    audit(s,u,'lms_link',f'course={course_id} moodle={lms_course_id}');s.commit()
+    return RedirectResponse(f'/courses/{course_id}?msg='+quote(f'Linked to Moodle course {lms_course_id}.'),303)
+
+@app.post('/courses/{course_id}/lms/sync')
+def lms_sync(course_id:int,u:User=Depends(actor),s:Session=Depends(db),_csrf:None=Depends(check_csrf)):
+    require_lms_staff(s,u,course_id,('lecturer','hod','dean'))
+    link=s.get(LmsCourseLink,course_id)
+    if not link:raise HTTPException(409,'Link this offering to a Moodle course first')
+    try:
+        engagement,grades=MoodleClient(os.getenv('MOODLE_URL'),os.getenv('MOODLE_TOKEN')).course_evidence(link.lms_course_id)
+    except MoodleError as exc:
+        raise HTTPException(502,str(exc))
+    result=save_lms_evidence(s,u,course_id,engagement,grades,'moodle')
+    link.last_sync_at=datetime.utcnow();s.commit()
+    return RedirectResponse(f'/courses/{course_id}?msg='+quote('Moodle sync complete. '+lms_message(*result)),303)
+
+
+def require_pilot_viewer(u):
+    if u.role not in ('dean','hod','admin'):raise HTTPException(403,'Pilot evaluation is available to the Dean, HODs and administrators')
+
+def pilot_data(s,u,days=30):
+    from collections import Counter,defaultdict
+    days=max(1,min(days,365))
+    since=datetime.utcnow()-timedelta(days=days)
+    events=s.query(UsageEvent).filter(UsageEvent.created_at>=since).all()
+    feature_counts=Counter(e.feature for e in events)
+    feature_users=defaultdict(set)
+    for e in events:feature_users[e.feature].add(e.user_id)
+    by_feature=[{'feature':f,'events':n,'users':len(feature_users[f])} for f,n in feature_counts.most_common()]
+    accounts=Counter(r for (r,) in s.query(User.role).all())
+    active=defaultdict(set)
+    for e in events:active[e.role].add(e.user_id)
+    by_role=[{'role':r,'accounts':accounts.get(r,0),'active':len(active.get(r,())),
+              'adoption':round(100*len(active.get(r,()))/accounts[r]) if accounts.get(r) else None} for r in ('dean','hod','lecturer','ta','admin')]
+    today=datetime.utcnow().date()
+    per_day=Counter(e.created_at.date() for e in events)
+    daily=[{'date':(today-timedelta(days=i)).isoformat(),'events':per_day.get(today-timedelta(days=i),0),
+            'users':len({e.user_id for e in events if e.created_at.date()==today-timedelta(days=i)})} for i in range(13,-1,-1)]
+    feedback=s.query(PilotFeedback).filter(PilotFeedback.created_at>=since).order_by(PilotFeedback.created_at.desc()).all()
+    fb_feature=defaultdict(list)
+    for f in feedback:fb_feature[f.feature].append(f)
+    def avg(values):
+        values=[v for v in values if v];return round(sum(values)/len(values),1) if values else None
+    feedback_by_feature=sorted([{'feature':k,'responses':len(v),'usefulness':avg(x.usefulness for x in v),'ease':avg(x.ease for x in v),
+        'bugs':sum(x.kind=='bug' for x in v),'requests':sum(x.kind=='feature_request' for x in v)} for k,v in fb_feature.items()],key=lambda x:-x['responses'])
+    completeness=[]
+    for c in s.query(Course).order_by(Course.programme,Course.code).all():
+        if not allowed(u,c):continue
+        ids={e.student_id for e in s.query(Enrollment).filter_by(course_id=c.id).all()}
+        n=len(ids)
+        assessed={a.student_id for a in s.query(Assessment).filter_by(course_id=c.id).all()}&ids
+        lms_ids={a.student_id for a in s.query(LmsActivity).filter_by(course_id=c.id).all()}&ids
+        attendance=s.query(Attendance).filter_by(course_id=c.id).count()
+        topics=s.query(TeachingPlanItem).filter_by(course_id=c.id).all()
+        pct=lambda k:round(100*k/n) if n else None
+        completeness.append({'id':c.id,'code':c.code,'programme':c.programme,'enrolled':n,'attendance_records':attendance,
+            'assessed_percent':pct(len(assessed)),'lms_percent':pct(len(lms_ids)),
+            'topics':len(topics),'approved_topics':sum(t.status=='approved' for t in topics),
+            'credits_verified':s.get(OfferingCreditConfig,c.id) is not None})
+    lms_evidence=s.query(LmsActivity).filter_by(source='moodle').first() is not None
+    bench=pilot_mod.benchmark(lms_connected=pilot_mod.moodle_configured(),lms_evidence=lms_evidence,https=os.getenv('COOKIE_SECURE','0')=='1')
+    return {'days':days,'events':len(events),'active_users':len({e.user_id for e in events}),
+            'sign_ins':feature_counts.get('Sign-in',0),'by_feature':by_feature,'by_role':by_role,'daily':daily,
+            'feedback_count':len(feedback),'satisfaction':avg(f.usefulness for f in feedback),'ease':avg(f.ease for f in feedback),
+            'feedback_by_feature':feedback_by_feature,'recent_feedback':feedback[:25],
+            'requests':[f for f in feedback if f.kind=='feature_request'],'bugs':[f for f in feedback if f.kind=='bug'],
+            'completeness':completeness,'benchmark':bench}
+
+@app.get('/pilot',response_class=HTMLResponse)
+def pilot_page(request:Request,days:int=30,u:User=Depends(actor),s:Session=Depends(db)):
+    require_pilot_viewer(u)
+    return templates.TemplateResponse(request,'pilot.html',{'user':u,**pilot_data(s,u,days)})
+
+@app.get('/api/pilot')
+def pilot_api(days:int=30,u:User=Depends(actor),s:Session=Depends(db)):
+    require_pilot_viewer(u)
+    data=pilot_data(s,u,days)
+    for key in ('recent_feedback','requests','bugs'):
+        data[key]=[{'date':f.created_at.date().isoformat(),'role':f.role,'feature':f.feature,'kind':f.kind,'usefulness':f.usefulness,'ease':f.ease,'comment':f.comment} for f in data[key]]
+    return data
+
+def csv_response(name,header,rows):
+    out=io.StringIO();w=csv.writer(out);w.writerow(header);w.writerows(rows)
+    return Response(out.getvalue(),media_type='text/csv',headers={'Content-Disposition':f'attachment; filename="{name}"','Cache-Control':'no-store'})
+
+@app.get('/pilot/{dataset}.csv')
+def pilot_export(dataset:str,days:int=365,u:User=Depends(actor),s:Session=Depends(db)):
+    require_pilot_viewer(u)
+    since=datetime.utcnow()-timedelta(days=max(1,min(days,3650)))
+    if dataset=='usage':
+        rows=[[e.created_at.isoformat(timespec='seconds'),f'user-{e.user_id}',e.role,e.feature,e.method] for e in s.query(UsageEvent).filter(UsageEvent.created_at>=since).order_by(UsageEvent.created_at)]
+        return csv_response('sefa_pilot_usage.csv',['timestamp_utc','user_pseudonym','role','feature','method'],rows)
+    if dataset=='feedback':
+        rows=[[f.created_at.isoformat(timespec='seconds'),f'user-{f.user_id}',f.role,f.feature,f.kind,f.usefulness or '',f.ease or '',f.comment] for f in s.query(PilotFeedback).filter(PilotFeedback.created_at>=since).order_by(PilotFeedback.created_at)]
+        return csv_response('sefa_pilot_feedback.csv',['timestamp_utc','user_pseudonym','role','feature','type','usefulness_1_5','ease_1_5','comment'],rows)
+    data=pilot_data(s,u,30)
+    if dataset=='benchmark':
+        return csv_response('sefa_capability_benchmark.csv',['category','capability','status','note'],[[i['category'],i['capability'],i['status'],i['note']] for i in data['benchmark']['capabilities']])
+    if dataset=='completeness':
+        rows=[[c['code'],c['programme'],c['enrolled'],c['attendance_records'],c['assessed_percent'],c['lms_percent'],c['approved_topics'],c['topics'],c['credits_verified']] for c in data['completeness']]
+        return csv_response('sefa_data_completeness.csv',['course','programme','enrolled','attendance_records','students_assessed_percent','students_with_lms_data_percent','approved_topics','planned_topics','credits_verified'],rows)
+    raise HTTPException(404,'Unknown export')
+
+@app.get('/feedback',response_class=HTMLResponse)
+def feedback_page(request:Request,sent:int=0,u:User=Depends(actor),s:Session=Depends(db)):
+    mine=s.query(PilotFeedback).filter_by(user_id=u.id).order_by(PilotFeedback.created_at.desc()).limit(10).all()
+    return templates.TemplateResponse(request,'feedback.html',{'user':u,'features':pilot_mod.FEEDBACK_FEATURES,'sent':sent,'mine':mine,'csrf':request.session.get('csrf','')})
+
+@app.post('/feedback')
+def submit_feedback(feature:str=Form(...),kind:str=Form(...),usefulness:str=Form(''),ease:str=Form(''),comment:str=Form(''),
+                    u:User=Depends(actor),s:Session=Depends(db),_csrf:None=Depends(check_csrf)):
+    if feature not in pilot_mod.FEEDBACK_FEATURES:raise HTTPException(400,'Choose a feature from the list')
+    if kind not in ('feedback','bug','feature_request'):raise HTTPException(400,'Invalid feedback type')
+    def rating(value,label):
+        if not value:return None
+        if value not in ('1','2','3','4','5'):raise HTTPException(400,f'{label} must be 1 to 5')
+        return int(value)
+    comment=comment.strip()[:2000]
+    if kind!='feedback' and not comment:raise HTTPException(400,'Please describe the problem or the feature you need')
+    s.add(PilotFeedback(user_id=u.id,role=u.role,feature=feature,kind=kind,usefulness=rating(usefulness,'Usefulness'),ease=rating(ease,'Ease of use'),comment=comment))
+    s.commit()
+    return RedirectResponse('/feedback?sent=1',303)

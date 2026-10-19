@@ -78,6 +78,23 @@ def main():
             lc.post(f"/api/teaching-plan/{item['id']}/report", data={'delivered_hours': str(hours), 'notes': 'Delivered as planned', 'csrf_token': lt})
         ta.post(f"/api/teaching-plan/{items[0]['id']}/ta-review", data={'decision': 'verify', 'csrf_token': tt})
         hc.post(f"/api/teaching-plan/{items[0]['id']}/hod-review", data={'decision': 'approve', 'csrf_token': ht})
+        lms = 'student_no,last_access,activities_completed,activities_total,minutes_active\n' + ''.join(
+            f'DEMO{k}{i:02d},{"Never" if i % 6 == 0 else (date(2026, 10, 16) - timedelta(days=(25 if i % 4 == 0 else random.randint(0, 6)))).isoformat()},'
+            f'{0 if i % 6 == 0 else (3 if i % 4 == 0 else random.randint(6, 10))},10,{0 if i % 6 == 0 else random.randint(40, 400)}\n' for i in range(len(NAMES)))
+        ta.post(f'/courses/{cid}/lms/engagement', data={'csrf_token': tt}, files={'file': ('lms.csv', lms.encode(), 'text/csv')})
+        quiz = 'student_no,item,score,max_score\n' + ''.join(f'DEMO{k}{i:02d},Quiz: Week 1 online quiz,{random.randint(3, 5) if i % 4 == 0 else random.randint(6, 10)},10\n' for i in range(len(NAMES)))
+        lc.post(f'/courses/{cid}/lms/grades', data={'csrf_token': lt}, files={'file': ('quiz.csv', quiz.encode(), 'text/csv')})
+    dean, dt = login('dean')
+    dean.get('/monitor', headers={'accept': 'text/html'}); dean.get('/ai-risk', headers={'accept': 'text/html'})
+    for client, token, feature, kind, useful, ease, comment in [
+        (lc, lt, 'Risk analytics', 'feedback', '5', '4', 'Explanations help me decide whom to call first.'),
+        (lc, lt, 'Spreadsheet import', 'bug', '3', '2', 'Dates typed as 12/10/2026 in Excel are rejected; please accept that format.'),
+        (ta, tt, 'Spreadsheet import', 'feedback', '4', '4', 'Preview before saving is reassuring.'),
+        (ta, tt, 'LMS import', 'feature_request', '4', '3', 'Pull Moodle data automatically every night.'),
+        (hc, ht, 'Academic monitoring', 'feature_request', '4', '4', 'Email me weekly when a course falls behind 85% coverage.'),
+        (dean, dt, 'Overall system', 'feature_request', '4', '4', 'SMS alerts to students with high risk, after lecturer approval.'),
+        (dean, dt, 'Teaching plan workflow', 'feedback', '5', '3', '')]:
+        client.post('/feedback', data={'feature': feature, 'kind': kind, 'usefulness': useful, 'ease': ease, 'comment': comment, 'csrf_token': token})
     print('Demo data loaded (made-up students only).')
     print(f'  admin / {ADMIN_PW}')
     for u in ('dean', 'hod.finance', 'lecturer.finance', 'ta.finance'):

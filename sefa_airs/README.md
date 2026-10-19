@@ -242,3 +242,22 @@ Verified by driving the full workflow over HTTP and in a real browser (float mod
 - Added `tests/test_end_to_end.py`; tests run on a temporary database (`tests/conftest.py`), never on `sefa.db`.
 
 Run tests: `pip install -r requirements.txt` then `python -m pytest -q` from this folder.
+
+
+## Version 0.21: pilot evaluation, benchmark and LMS (Moodle)
+
+### Pilot evaluation (`/pilot`, Dean / HOD / admin)
+- **Usage analytics:** every page visit and action is logged with the staff member's role and the feature used (no student data). The dashboard shows active staff, sign-ins, usage per feature, adoption per role and daily activity.
+- **Feedback:** every user has **Give feedback** in the menu: usefulness and ease ratings (1–5), problem reports and feature requests.
+- **Data completeness:** per course, the share of students with marks and LMS data, attendance entries, approved teaching topics and credit verification.
+- **Benchmark:** a capability checklist against what a full university early-alert system normally has (implemented / partial / not yet), with readiness % per area. It is a self-assessment, not certification.
+- **Exports for analysis:** usage, feedback, completeness and benchmark as CSV (Excel/SPSS/Stata/R), plus `/api/pilot` JSON. Staff are pseudonymised (`user-12`).
+
+### LMS evidence (course page → "LMS (Moodle) evidence")
+1. **Engagement upload:** `student_no,last_access` (+ optional `activities_completed,activities_total,minutes_active`). Template: `static/samples/lms_engagement_template.csv`.
+2. **Moodle gradebook export:** Grades → Export → Plain text file, include *ID number*, display type **Percentage**. Or the `student_no,item,score,max_score` template. Grades become assessments titled `LMS: …` and therefore count in the assessment evidence.
+3. **Automatic sync (optional):** copy `settings.env.example` to `settings.env` and set `MOODLE_URL` and `MOODLE_TOKEN`, then restart. On each course, save the Moodle course ID and press *Sync now*.
+
+Moodle administrator steps for the token: enable *Web services* and the *REST* protocol; create an external service containing `core_enrol_get_enrolled_users` and `gradereport_user_get_grade_items`; create a token for a dedicated service account allowed to view participants and grades in the pilot courses. Students are matched by Moodle **ID number** (or username) = SEFA `student_no`; LMS accounts not on the roster (e.g. teachers) are skipped and counted.
+
+LMS engagement is **shown as context** in the risk dashboard (last access, completion, reasons such as "No LMS course access for 21 days") but **does not change the risk index**, because its weight has not been validated. The Moodle connector has been tested against a simulated Moodle API, not yet a live UoK Moodle.
